@@ -3046,3 +3046,351 @@ CREATE INDEX IF NOT EXISTS idx_analysis_wide_pp
   ON tte.analysis_wide(pp_analysis_flag);
 
 ANALYZE tte.analysis_wide;
+
+
+
+---step1.11
+
+DROP TABLE IF EXISTS tte.followup_window_28d;
+
+CREATE TABLE tte.followup_window_28d AS
+WITH base AS (
+  SELECT
+    ci.stay_id,
+    ci.subject_id,
+    ci.hadm_id,
+    ci.tL::timestamp AS tL,
+    (ci.tL + interval '28 days')::timestamp AS t28
+  FROM tte.cohort_index ci
+)
+SELECT
+  b.stay_id,
+  b.subject_id,
+  b.hadm_id,
+  b.tL,
+  b.t28,
+
+  bfs.admittime::timestamp  AS admittime,
+  bfs.dischtime::timestamp  AS dischtime,
+
+  -- 全因死亡时间：优先院内 deathtime，补充 patients.dod（可能日期精度）
+  COALESCE(adm.deathtime::timestamp, pat.dod::timestamp) AS death_time,
+
+  CASE
+    WHEN COALESCE(adm.deathtime::timestamp, pat.dod::timestamp) IS NOT NULL
+     AND COALESCE(adm.deathtime::timestamp, pat.dod::timestamp) > b.tL
+     AND COALESCE(adm.deathtime::timestamp, pat.dod::timestamp) <= b.t28
+    THEN 1 ELSE 0
+  END AS death_28_flag,
+
+  -- 28天内（从tL起）住院天数（截断到[0,28]）
+  LEAST(
+    28.0,
+    GREATEST(
+      0.0,
+      EXTRACT(EPOCH FROM (LEAST(bfs.dischtime::timestamp, b.t28) - b.tL)) / 86400.0
+    )
+  ) AS hosp_days_28d_from_tL
+
+FROM base b
+JOIN tte.base_first_stay bfs
+  ON bfs.stay_id = b.stay_id
+JOIN mimiciv_hosp.admissions adm
+  ON adm.hadm_id = b.hadm_id
+JOIN mimiciv_hosp.patients pat
+  ON pat.subject_id = b.subject_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fu28_stay_id
+  ON tte.followup_window_28d(stay_id);
+
+ANALYZE tte.followup_window_28d;
+
+DROP TABLE IF EXISTS tte.hfd_28d;
+
+CREATE TABLE tte.hfd_28d AS
+SELECT
+  f.stay_id,
+  f.tL,
+  f.t28,
+  f.dischtime,
+  f.death_time,
+  f.death_28_flag,
+  f.hosp_days_28d_from_tL,
+
+  CASE
+    WHEN f.death_28_flag = 1 THEN 0
+    WHEN f.dischtime IS NULL THEN 0
+    WHEN f.dischtime >= f.t28 THEN 0
+    WHEN f.dischtime <= f.tL THEN 28
+    ELSE GREATEST(
+           0,
+           28 - CEIL(EXTRACT(EPOCH FROM (f.dischtime - f.tL)) / 86400.0)::int
+         )
+  END AS hfd_28
+
+FROM tte.followup_window_28d f;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hfd28_stay_id
+  ON tte.hfd_28d(stay_id);
+
+ANALYZE tte.hfd_28d;
+
+DROP TABLE IF EXISTS tte.ventilation_28d_agg;
+
+CREATE TABLE tte.ventilation_28d_agg AS
+WITH fu AS (
+  SELECT stay_id, tL, t28, death_28_flag
+  FROM tte.followup_window_28d
+),
+vent_raw AS (
+  SELECT
+    fu.stay_id,
+    fu.tL,
+    fu.t28,
+    v.starttime::timestamp AS starttime,
+    v.endtime::timestamp   AS endtime,
+    v.ventilation_status::text AS ventilation_status
+  FROM fu
+  JOIN mimiciv_derived.ventilation v
+    ON v.stay_id = fu.stay_id
+   AND v.endtime   > fu.tL
+   AND v.starttime < fu.t28
+  WHERE v.ventilation_status IN ('InvasiveVent', 'Tracheostomy')
+),
+vent_clip AS (
+  SELECT
+    stay_id,
+    GREATEST(starttime, tL) AS seg_start,
+    LEAST(endtime, t28)     AS seg_end,
+    t28
+  FROM vent_raw
+  WHERE endtime IS NOT NULL
+),
+vent_sum AS (
+  SELECT
+    stay_id,
+    SUM(EXTRACT(EPOCH FROM (seg_end - seg_start))) AS vent_seconds_28d,
+    COUNT(*) AS n_segments_28d
+  FROM vent_clip
+  WHERE seg_end > seg_start
+  GROUP BY stay_id
+),
+vent_day28 AS (
+  -- 是否“在第28天时仍处于侵袭通气”（任何段跨过t28）
+  SELECT
+    vr.stay_id,
+    MAX(
+      CASE WHEN vr.starttime < vr.t28 AND vr.endtime > vr.t28 THEN 1 ELSE 0 END
+    ) AS on_vent_at_day28_flag
+  FROM vent_raw vr
+  GROUP BY vr.stay_id
+)
+SELECT
+  fu.stay_id,
+  COALESCE(vs.vent_seconds_28d, 0) AS vent_seconds_28d,
+  (COALESCE(vs.vent_seconds_28d, 0) / 86400.0) AS vent_days_28d,
+  COALESCE(vs.n_segments_28d, 0) AS vent_n_segments_28d,
+  COALESCE(vd.on_vent_at_day28_flag, 0) AS on_vent_at_day28_flag
+FROM fu
+LEFT JOIN vent_sum vs
+  ON vs.stay_id = fu.stay_id
+LEFT JOIN vent_day28 vd
+  ON vd.stay_id = fu.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vent28_stay_id
+  ON tte.ventilation_28d_agg(stay_id);
+
+ANALYZE tte.ventilation_28d_agg;
+
+DROP TABLE IF EXISTS tte.vfd_28d;
+
+CREATE TABLE tte.vfd_28d AS
+SELECT
+  fu.stay_id,
+  fu.death_28_flag,
+  va.vent_seconds_28d,
+  va.vent_days_28d,
+  va.on_vent_at_day28_flag,
+
+  CASE
+    WHEN fu.death_28_flag = 1 THEN 0
+    WHEN va.on_vent_at_day28_flag = 1 THEN 0
+    ELSE GREATEST(0, 28 - CEIL(va.vent_days_28d)::int)
+  END AS vfd_28
+
+FROM tte.followup_window_28d fu
+LEFT JOIN tte.ventilation_28d_agg va
+  ON va.stay_id = fu.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vfd28_stay_id
+  ON tte.vfd_28d(stay_id);
+
+ANALYZE tte.vfd_28d;
+
+
+
+DROP TABLE IF EXISTS tte.blood_product_itemids;
+
+CREATE TABLE tte.blood_product_itemids AS
+SELECT DISTINCT
+  di.itemid::int AS itemid,
+  di.label::text AS label,
+  CASE
+    WHEN di.label ~* '(packed\\s*red|\\mprbc\\M|red\\s*blood\\s*cells|\\mrbc\\M)'
+      THEN 'RBC'
+    WHEN di.label ~* '(platelet)'
+      THEN 'PLT'
+    ELSE NULL
+  END AS product_type
+FROM mimiciv_icu.d_items di
+WHERE
+      di.label ~* '(packed\\s*red|\\mprbc\\M|red\\s*blood\\s*cells|\\mrbc\\M|platelet)'
+  AND di.label !~* '(flush|lock)';
+
+CREATE INDEX IF NOT EXISTS idx_blood_itemids_type
+  ON tte.blood_product_itemids(product_type, itemid);
+
+ANALYZE tte.blood_product_itemids;
+
+DROP TABLE IF EXISTS tte.transfusion_28d;
+
+CREATE TABLE tte.transfusion_28d AS
+WITH fu AS (
+  SELECT stay_id, tL, t28
+  FROM tte.followup_window_28d
+),
+ie AS (
+  SELECT
+    i.stay_id,
+    i.starttime::timestamp AS starttime,
+    i.itemid::int          AS itemid,
+    i.amount::numeric      AS amount,
+    i.amountuom::text      AS amountuom
+  FROM mimiciv_icu.inputevents i
+  WHERE i.starttime IS NOT NULL
+),
+joined AS (
+  SELECT
+    fu.stay_id,
+    fu.tL,
+    fu.t28,
+    ie.starttime,
+    bp.product_type,
+    ie.amount,
+    ie.amountuom
+  FROM fu
+  JOIN ie
+    ON ie.stay_id = fu.stay_id
+   AND ie.starttime > fu.tL
+   AND ie.starttime <= fu.t28
+  JOIN tte.blood_product_itemids bp
+    ON bp.itemid = ie.itemid
+  WHERE bp.product_type IN ('RBC', 'PLT')
+)
+SELECT
+  stay_id,
+
+  MAX(CASE WHEN product_type='RBC' THEN 1 ELSE 0 END) AS rbc_any_28d,
+  COUNT(*) FILTER (WHERE product_type='RBC') AS rbc_n_events_28d,
+  SUM(amount) FILTER (WHERE product_type='RBC' AND amountuom ILIKE '%unit%') AS rbc_units_28d,
+  SUM(amount) FILTER (WHERE product_type='RBC' AND amountuom ILIKE '%ml%')   AS rbc_ml_28d,
+
+  MAX(CASE WHEN product_type='PLT' THEN 1 ELSE 0 END) AS plt_any_28d,
+  COUNT(*) FILTER (WHERE product_type='PLT') AS plt_n_events_28d,
+  SUM(amount) FILTER (WHERE product_type='PLT' AND amountuom ILIKE '%unit%') AS plt_units_28d,
+  SUM(amount) FILTER (WHERE product_type='PLT' AND amountuom ILIKE '%ml%')   AS plt_ml_28d
+
+FROM joined
+GROUP BY stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trans28_stay_id
+  ON tte.transfusion_28d(stay_id);
+
+ANALYZE tte.transfusion_28d;
+
+DROP TABLE IF EXISTS tte.outcomes_secondary_28d;
+
+CREATE TABLE tte.outcomes_secondary_28d AS
+SELECT
+  fu.stay_id,
+  fu.subject_id,
+  fu.hadm_id,
+  fu.tL,
+  fu.t28,
+
+  fu.death_time,
+  fu.death_28_flag,
+
+  fu.hosp_days_28d_from_tL,
+  hfd.hfd_28,
+
+  vfd.vfd_28,
+  va.vent_days_28d,
+  va.vent_n_segments_28d,
+
+  COALESCE(tr.rbc_any_28d, 0) AS rbc_any_28d,
+  tr.rbc_n_events_28d,
+  tr.rbc_units_28d,
+  tr.rbc_ml_28d,
+
+  COALESCE(tr.plt_any_28d, 0) AS plt_any_28d,
+  tr.plt_n_events_28d,
+  tr.plt_units_28d,
+  tr.plt_ml_28d
+
+FROM tte.followup_window_28d fu
+LEFT JOIN tte.hfd_28d hfd
+  ON hfd.stay_id = fu.stay_id
+LEFT JOIN tte.vfd_28d vfd
+  ON vfd.stay_id = fu.stay_id
+LEFT JOIN tte.ventilation_28d_agg va
+  ON va.stay_id = fu.stay_id
+LEFT JOIN tte.transfusion_28d tr
+  ON tr.stay_id = fu.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outsec28_stay_id
+  ON tte.outcomes_secondary_28d(stay_id);
+
+ANALYZE tte.outcomes_secondary_28d;
+
+
+DROP TABLE IF EXISTS tte.analysis_wide_v2;
+
+CREATE TABLE tte.analysis_wide_v2 AS
+SELECT
+  aw.*,
+
+  -- HFD/VFD/住院天数/通气天数
+  os.hosp_days_28d_from_tL,
+  os.hfd_28,
+  os.vfd_28,
+  os.vent_days_28d,
+  os.vent_n_segments_28d,
+
+  -- 为避免与 aw.* 中同名列冲突，这里统一加后缀 _28d
+  os.death_28_flag AS death_28_flag_28d,
+  os.death_time    AS death_time_28d,
+
+  -- 输血
+  os.rbc_any_28d,
+  os.rbc_n_events_28d,
+  os.rbc_units_28d,
+  os.rbc_ml_28d,
+
+  os.plt_any_28d,
+  os.plt_n_events_28d,
+  os.plt_units_28d,
+  os.plt_ml_28d
+
+FROM tte.analysis_wide aw
+LEFT JOIN tte.outcomes_secondary_28d os
+  ON os.stay_id = aw.stay_id;
+
+CREATE INDEX IF NOT EXISTS idx_aw_v2_primary_flag
+  ON tte.analysis_wide_v2(primary_analysis_flag);
+
+CREATE INDEX IF NOT EXISTS idx_aw_v2_exposure_group
+  ON tte.analysis_wide_v2(exposure_group);
+
+ANALYZE tte.analysis_wide_v2;
+
